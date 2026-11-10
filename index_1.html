@@ -1,0 +1,1273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0"/>
+  <title>XYGO Wind Rose</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'DM Sans',sans-serif;background:#f0f5f5;min-height:100vh}
+    ::-webkit-scrollbar{width:4px}
+    ::-webkit-scrollbar-thumb{background:#b2d8d6;border-radius:2px}
+    input[type=number]::-webkit-inner-spin-button{opacity:1}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script type="text/babel">
+const {useState} = React;
+
+/* -- WEBHOOK ---------------------------------------------------
+   Paste the Web App URL of the Apps Script deployment (gas/Code.gs,
+   bound to the NEW spreadsheet). While the placeholder is in place the
+   questionnaire refuses to submit, instead of failing silently.
+------------------------------------------------------------------ */
+const WEBHOOK = "INCOLLA_QUI_URL_DEPLOYMENT_XYGO_RANDOMIZED";
+const WEBHOOK_OK = WEBHOOK.indexOf("INCOLLA_QUI") === -1;
+const STUDY_VERSION = "rand-v1";
+
+/* -- ORDER RANDOMIZATION ---------------------------------------
+   The order of the two blocks (XYGO scales / self-labels) is decided
+   by the LAST character of the 6-character token. The token alphabet
+   has 32 symbols: the first 16 give XYGO_first, the last 16 give
+   LABELS_first. The token is generated at the start of T1 and typed
+   back by the participant at T2, so the same order is rebuilt at T2
+   without any server call. Keep this alphabet identical to the one
+   in gas/Code.gs.
+------------------------------------------------------------------ */
+const TOKEN_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const TOKEN_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/;
+function randomToken() {
+  var buf = new Uint8Array(6);
+  if (window.crypto && window.crypto.getRandomValues) {
+    window.crypto.getRandomValues(buf);
+  } else {
+    for (var j = 0; j < 6; j++) buf[j] = Math.floor(Math.random() * 256);
+  }
+  var out = "";
+  for (var i = 0; i < 6; i++) out += TOKEN_CHARS.charAt(buf[i] % 32);
+  return out;
+}
+function orderFromToken(token) {
+  if (!TOKEN_RE.test(token)) return null;
+  return TOKEN_CHARS.indexOf(token.charAt(5)) < 16 ? "XYGO_first" : "LABELS_first";
+}
+
+/* ── PALETTE ─────────────────────────────────────────────────── */
+const T  = "#4da8a4";
+const TL = "#8dcfcc";
+const TP = "#d6efee";
+const TD = "#2a8c88";
+const CR = "#e05c5c";
+const BG = "#f0f5f5";
+
+/* ── CONSTANTS ───────────────────────────────────────────────── */
+const SZ = 320, CX = 160, CY = 160, U = 32;
+const PTS = [-3, -2, -1, 0, 1, 2, 3];
+
+/* ── HELPERS ─────────────────────────────────────────────────── */
+const fmt = v => v > 0 ? `+${v}` : `${v}`;
+
+function buildNotation(sex, gVals, fluidG, oVals, fluidO) {
+  if (!sex || gVals.length === 0 || oVals.length === 0) return "";
+  const sg = [...gVals].sort((a, b) => a - b);
+  const so = [...oVals].sort((a, b) => a - b);
+  const gStr = (fluidG && sg.length > 1)
+    ? `G${fmt(sg[0])}:${fmt(sg[sg.length - 1])}`
+    : `G${sg.map(fmt).join(",")}`;
+  const oStr = (fluidO && so.length > 1)
+    ? `O${fmt(so[0])}:${fmt(so[so.length - 1])}`
+    : `O${so.map(fmt).join(",")}`;
+  return `${sex}; ${gStr}; ${oStr}`;
+}
+
+function petalPath(cx, cy, tx, ty, w) {
+  const dx = tx - cx, dy = ty - cy;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len === 0) return "";
+  const px = -dy / len * w, py = dx / len * w;
+  const mx = (cx + tx) / 2, my = (cy + ty) / 2;
+  return `M ${cx} ${cy} Q ${mx+px} ${my+py} ${tx} ${ty} Q ${mx-px} ${my-py} ${cx} ${cy} Z`;
+}
+
+/* ── TRANSLATIONS ────────────────────────────────────────────── */
+const L = {
+  en: {
+    roseTitle:"XYGO", roseSub:"WIND ROSE",
+    protocolA:"You have been invited to the ",
+    protocolB:"XYGO validation protocol",
+    protocolC:", the psychometric test for measuring sexual identity. After the first session, you are invited to complete the test again after ",
+    protocolD:"10–14 days",
+    protocolE:". If you wish, on the final screen you will be able to enter your email address to receive a reminder message.",
+    protocolNotice:"⏳ Please wait at least 10 days before starting the second session.",
+    p1a:"Please identify yourself according to your ",
+    p1b:"assigned sex at birth",
+    p1c:", and rate your ",
+    p1d:"gender identity",
+    p1e:" and ",
+    p1f:"sexual orientation",
+    p1g:" on the compass scales.",
+    p2a:"Please refer to your feelings over the ",
+    p2b:"past 4 weeks",
+    p2c:". There are no right or wrong answers.",
+    consentText:"I have read and understood the above. I give my informed consent to participate anonymously in this study.",
+    begin:"Begin \u2192",
+    sexTitle:"Assigned sex at birth",
+    sexSub:"Select the symbol that best represents your assigned sex at birth.",
+    afab:"Assigned female\nat birth (AFAB)",
+    amab:"Assigned male\nat birth (AMAB)",
+    dsd:"Persons with DSD or aneuploid conditions may choose the symbol corresponding to their prevalent phenotype.",
+    back:"\u2190 Back", next:"Next \u2192",
+    identityTitle:"About you",
+    ageQ:"Age",
+    ageReq:"(required)",
+    genderQ:"How do you identify your gender?",
+    orientQ:"How do you define your sexual orientation?",
+    genderOptsAMAB:[
+      "Cisgender (I identify as male)",
+      "Partially cisgender (I partially identify as male)",
+      "Agender (I identify as neither male nor female)",
+      "Genderless (I do not identify with any gender)",
+      "Partially transgender (I partially identify as a woman)",
+      "Transgender (I fully identify as a woman)",
+      "Pangender (I identify as every gender)",
+      "Gender fluid (I do not consistently identify with a single gender)"
+    ],
+    genderOptsAFAB:[
+      "Cisgender (I identify as female)",
+      "Partially cisgender (I partially identify as female)",
+      "Agender (I identify as neither female nor male)",
+      "Genderless (I do not identify with any gender)",
+      "Partially transgender (I partially identify as a man)",
+      "Transgender (I fully identify as a man)",
+      "Pangender (I identify as every gender)",
+      "Gender fluid (I do not consistently identify with a single gender)"
+    ],
+    orientOpts:["Heterosexual","Partially heterosexual","Homosexual","Partially homosexual","Asexual","Pansexual","Bisexual"],
+    genderScaleTitle:"Gender Identity",
+    genderDesc:"Gender identity is a person\u2019s deeply held internal sense of their own gender. It may or may not align with the sex assigned at birth. Tap one or more points on the vertical scale.",
+    genderLeft:"Perceived gender: male",
+    genderRight:"Perceived gender: female",
+    fluidLabel:"My gender identity is fluid",
+    fluidHint:"When checked, your selected points are shown as a continuous range.",
+    orientScaleTitle:"Sexual Orientation",
+    orientDesc:"Sexual orientation refers to the enduring pattern of emotional, romantic, and/or sexual attraction one feels toward others. Tap one or more points on the horizontal scale.",
+    orientLeft:"Sexual orientation: other sex",
+    orientRight:"Sexual orientation: same sex",
+    orientFluidLabel:"My sexual orientation is fluid",
+    orientFluidHint:"When checked, your selected points are shown as a continuous range.",
+    notLbl:"Notation:",
+    submit:"Submit \u2713", saving:"Sending\u2026",
+    errMsg:"Could not send. Please check your connection.",
+    doneTitle:"Thank you!",
+    doneSub:"Your response has been recorded anonymously.",
+    doneLabel:"Your XYGO notation",
+    newResp:"New response",
+    female:"Female", male:"Male", same:"Same sex", other:"Other sex",
+    step:"Step", of:"of",
+    timepointQ:"Is this your first or second session?",
+    tp1:"First session (T1)",
+    tp2:"Second session (T2)",
+    tokenInputLabel:"Enter your T1 token",
+    tokenInputPh:"e.g. XK4R2M",
+    tokenInputHint:"You received this code at the end of your first session.",
+    tokenMissing:"Please enter the token from your first session.",
+    tokenInvalid:"The token must have 6 characters (letters and digits, no O, I, 0, 1).",
+    doneTokenLabel:"Your personal token",
+    doneTokenInstr:"Save this code — you will need it to start your second session.",
+    doneCopyBtn:"Copy",
+    doneCopied:"✓ Copied!",
+    doneSubT2:"Your second response has been recorded. Thank you for participating in both sessions.",
+    emailOptLabel:"Would you like a reminder in 10 days to complete the second session?",
+    emailOptPh:"Your email address (optional)",
+    emailOptHint:"Your email will be stored separately from your responses and deleted immediately after the reminder is sent.",
+    emailOptBtn:"Send me a reminder",
+    emailOptSent:"✓ Reminder scheduled!",
+  },
+  it: {
+    roseTitle:"XYGO", roseSub:"ROSA DEI VENTI",
+    protocolA:"Sei stata/o invitata/o al protocollo di validazione di ",
+    protocolB:"XYGO",
+    protocolC:", il test psicometrico per la misurazione dell\u2019identit\u00e0 sessuale. Dopo la prima compilazione, sei invitata/o a compilare nuovamente il test dopo ",
+    protocolD:"10/14 giorni",
+    protocolE:". Se vorrai, nell\u2019ultima schermata potrai inserire il tuo indirizzo email per ricevere un messaggio di promemoria.",
+    protocolNotice:"\u23f3 Attendi almeno 10 giorni prima di iniziare la seconda compilazione.",
+    p1a:"Per favore identificati in base al tuo ",
+    p1b:"sesso assegnato alla nascita",
+    p1c:", e valuta la tua ",
+    p1d:"identit\u00e0 di genere",
+    p1e:" e il tuo ",
+    p1f:"orientamento sessuale",
+    p1g:" sulle scale della bussola.",
+    p2a:"Fai riferimento alle tue percezioni nelle ",
+    p2b:"ultime 4 settimane",
+    p2c:". Non esistono risposte giuste o sbagliate.",
+    consentText:"Ho letto e compreso quanto sopra. Esprimo il mio consenso informato a partecipare anonimamente a questo studio.",
+    begin:"Inizia \u2192",
+    sexTitle:"Sesso assegnato alla nascita",
+    sexSub:"Seleziona il simbolo che meglio rappresenta il tuo sesso assegnato alla nascita.",
+    afab:"Femmina alla\nnascita (AFAB)",
+    amab:"Maschio alla\nnascita (AMAB)",
+    dsd:"Le persone con DSD o condizioni aneuploidi possono scegliere il simbolo corrispondente al fenotipo prevalente.",
+    back:"\u2190 Indietro", next:"Avanti \u2192",
+    identityTitle:"Informazioni su di te",
+    ageQ:"Et\u00e0",
+    ageReq:"(obbligatoria)",
+    genderQ:"Come definisci la tua identit\u00e0 di genere?",
+    orientQ:"Come definisci il tuo orientamento sessuale?",
+    genderOptsAMAB:[
+      "Cisgender (mi identifico come maschio)",
+      "Parzialmente cisgender (mi identifico parzialmente come maschio)",
+      "Agender (non mi identifico n\u00e9 come maschio, n\u00e9 come femmina)",
+      "Senza genere (non mi identifico in alcun genere)",
+      "Parzialmente transgender (mi identifico parzialmente come donna)",
+      "Transgender (mi identifico completamente come donna)",
+      "Pangender (mi identifico come ogni genere)",
+      "Gender fluid (non mi identifico stabilmente in un solo genere)"
+    ],
+    genderOptsAFAB:[
+      "Cisgender (mi identifico come femmina)",
+      "Parzialmente cisgender (mi identifico parzialmente come femmina)",
+      "Agender (non mi identifico n\u00e9 come femmina, n\u00e9 come maschio)",
+      "Senza genere (non mi identifico in alcun genere)",
+      "Parzialmente transgender (mi identifico parzialmente come uomo)",
+      "Transgender (mi identifico completamente come uomo)",
+      "Pangender (mi identifico come ogni genere)",
+      "Gender fluid (non mi identifico stabilmente in un solo genere)"
+    ],
+    orientOpts:["Eterosessuale","Parzialmente eterosessuale","Omosessuale","Parzialmente omosessuale","Asessuale","Pansessuale","Bisessuale"],
+    genderScaleTitle:"Identit\u00e0 di genere",
+    genderDesc:"L\u2019identit\u00e0 di genere \u00e8 la percezione intima e profonda che una persona ha del proprio genere. Pu\u00f2 o meno corrispondere al sesso assegnato alla nascita. Tocca uno o pi\u00f9 punti sulla scala verticale.",
+    genderLeft:"Genere percepito: maschile",
+    genderRight:"Genere percepito: femminile",
+    fluidLabel:"La mia identit\u00e0 di genere \u00e8 fluida",
+    fluidHint:"Se selezionato, i punti scelti vengono mostrati come un intervallo continuo.",
+    orientScaleTitle:"Orientamento sessuale",
+    orientDesc:"L\u2019orientamento sessuale \u00e8 il pattern stabile di attrazione emotiva, romantica e/o sessuale che una persona prova verso gli altri. Tocca uno o pi\u00f9 punti sulla scala orizzontale.",
+    orientLeft:"Orientamento sessuale: sesso opposto",
+    orientRight:"Orientamento sessuale: stesso sesso",
+    orientFluidLabel:"Il mio orientamento sessuale \u00e8 fluido",
+    orientFluidHint:"Se selezionato, i punti scelti vengono mostrati come un intervallo continuo.",
+    notLbl:"Notazione:",
+    submit:"Invia \u2713", saving:"Invio in corso\u2026",
+    errMsg:"Impossibile inviare. Controlla la connessione.",
+    doneTitle:"Grazie!",
+    doneSub:"La tua risposta \u00e8 stata registrata anonimamente.",
+    doneLabel:"La tua notazione XYGO",
+    newResp:"Nuova risposta",
+    female:"Femminile", male:"Maschile", same:"Stesso sesso", other:"Sesso opposto",
+    step:"Passo", of:"di",
+    timepointQ:"Questa è la tua prima o seconda compilazione?",
+    tp1:"Prima compilazione (T1)",
+    tp2:"Seconda compilazione (T2)",
+    tokenInputLabel:"Inserisci il tuo token T1",
+    tokenInputPh:"es. XK4R2M",
+    tokenInputHint:"Hai ricevuto questo codice al termine della prima compilazione.",
+    tokenMissing:"Inserisci il token ricevuto alla prima compilazione.",
+    tokenInvalid:"Il token deve avere 6 caratteri (lettere e cifre, senza O, I, 0, 1).",
+    doneTokenLabel:"Il tuo token personale",
+    doneTokenInstr:"Conserva questo codice — ti servirà per iniziare la seconda compilazione.",
+    doneCopyBtn:"Copia",
+    doneCopied:"✓ Copiato!",
+    doneSubT2:"La tua seconda risposta è stata registrata. Grazie per aver partecipato a entrambe le sessioni.",
+    emailOptLabel:"Vuoi ricevere un promemoria tra 10 giorni per completare la seconda sessione?",
+    emailOptPh:"Il tuo indirizzo email (facoltativo)",
+    emailOptHint:"La tua email sarà conservata separatamente dai tuoi dati e cancellata immediatamente dopo l’invio del promemoria.",
+    emailOptBtn:"Inviami un promemoria",
+    emailOptSent:"✓ Promemoria programmato!",
+  }
+};
+
+/* ── ROSE SILHOUETTE (background only) ───────────────────────── */
+function RoseBg() {
+  const petals = [
+    { d: petalPath(CX, CY, CX,      CY-3*U, 18), fill: T,  o: 0.25 },
+    { d: petalPath(CX, CY, CX,      CY+3*U, 18), fill: T,  o: 0.25 },
+    { d: petalPath(CX, CY, CX+3*U,  CY,     18), fill: T,  o: 0.25 },
+    { d: petalPath(CX, CY, CX-3*U,  CY,     18), fill: T,  o: 0.25 },
+    { d: petalPath(CX, CY, CX+3*U,  CY-3*U, 12), fill: TL, o: 0.18 },
+    { d: petalPath(CX, CY, CX-3*U,  CY-3*U, 12), fill: TL, o: 0.18 },
+    { d: petalPath(CX, CY, CX+3*U,  CY+3*U, 12), fill: TL, o: 0.18 },
+    { d: petalPath(CX, CY, CX-3*U,  CY+3*U, 12), fill: TL, o: 0.18 },
+  ];
+  return (
+    <g>
+      <circle cx={CX} cy={CY} r={3*U + 14} fill={TP} opacity={0.38}/>
+      {petals.map((p, i) => <path key={i} d={p.d} fill={p.fill} opacity={p.o}/>)}
+      {/* Faint axis guides */}
+      <line x1={CX-3*U} y1={CY} x2={CX+3*U} y2={CY} stroke={TL} strokeWidth={1} opacity={0.30}/>
+      <line x1={CX} y1={CY-3*U} x2={CX} y2={CY+3*U} stroke={TL} strokeWidth={1} opacity={0.30}/>
+    </g>
+  );
+}
+
+/* ── GENDER SCALE SVG (vertical, interactive) ────────────────── */
+/*
+ * Y axis: +3 female at top (y = CY - 3U), -3 male at bottom (y = CY + 3U)
+ * Points are toggled individually; fluid fills a line between outermost selected.
+ */
+function GenderScaleSVG({ vals, fluid, onChange, t }) {
+  const toggle = p => onChange(vals.includes(p) ? vals.filter(v => v !== p) : [...vals, p]);
+
+  const sorted   = [...vals].sort((a, b) => a - b);
+  const hasRange = fluid && sorted.length >= 2;
+  const rMin     = hasRange ? sorted[0]                   : null;
+  const rMax     = hasRange ? sorted[sorted.length - 1]   : null;
+
+  /* y-coordinate of point p */
+  const py = p => CY - p * U;
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${SZ} ${SZ}`}
+      style={{ display: "block", margin: "0 auto", maxWidth: SZ, touchAction: "none" }}>
+
+      <RoseBg/>
+
+      {/* Track — vertical centre line */}
+      <line x1={CX} y1={py(3)} x2={CX} y2={py(-3)}
+        stroke="#ddeeed" strokeWidth={4} strokeLinecap="round"/>
+
+      {/* Fluid range fill */}
+      {hasRange && (
+        <line x1={CX} y1={py(rMax)} x2={CX} y2={py(rMin)}
+          stroke={TD} strokeWidth={4} strokeLinecap="round" opacity={0.85}/>
+      )}
+
+      {/* Y-axis labels — kept clear of the r=16 interactive circles */}
+      <text x={CX} y={py(3) - 26}
+        textAnchor="middle" dominantBaseline="auto"
+        fill={TD} fontSize={12} fontFamily="DM Sans" fontWeight="600">
+        {t.female}
+      </text>
+      <text x={CX} y={py(-3) + 34}
+        textAnchor="middle" dominantBaseline="auto"
+        fill={TD} fontSize={12} fontFamily="DM Sans" fontWeight="600">
+        {t.male}
+      </text>
+
+      {/* 7 interactive points */}
+      {PTS.map(p => {
+        const selected = vals.includes(p);
+        const inRange  = hasRange && p > rMin && p < rMax;
+        return (
+          <g key={p} onPointerDown={() => toggle(p)} style={{ cursor: "pointer" }}>
+            {/* Enlarged transparent hit area for mobile */}
+            <circle cx={CX} cy={py(p)} r={22} fill="transparent"/>
+            {/* Visual circle */}
+            <circle cx={CX} cy={py(p)} r={16}
+              fill={selected ? TD : inRange ? TL : "white"}
+              stroke={selected ? TD : inRange ? TL : "#d4e8e7"}
+              strokeWidth={2.5}
+              style={{ filter: selected ? "drop-shadow(0 2px 6px rgba(42,140,136,0.35))" : "none" }}
+            />
+            {/* Label — solo valore assoluto nella UI; il segno resta nel payload e nella notazione */}
+            <text cx={CX} x={CX} y={py(p)} textAnchor="middle" dominantBaseline="middle"
+              fontSize={10} fontFamily="DM Sans" fontWeight="700"
+              fill={selected ? "white" : inRange ? TD : "#aabcbb"}
+              style={{ pointerEvents: "none" }}>
+              {Math.abs(p)}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+/* ── ORIENTATION SCALE SVG (horizontal, interactive) ─────────── */
+/*
+ * X axis: -3 other sex at left (x = CX - 3U), +3 same sex at right (x = CX + 3U)
+ * G markers (from previous step) shown as read-only coral dots on Y axis.
+ */
+function OrientScaleSVG({ gVals, fluidG, vals, fluid, onChange, t }) {
+  const toggle = p => onChange(vals.includes(p) ? vals.filter(v => v !== p) : [...vals, p]);
+
+  const sorted   = [...vals].sort((a, b) => a - b);
+  const hasRange = fluid && sorted.length >= 2;
+  const rMin     = hasRange ? sorted[0]                   : null;
+  const rMax     = hasRange ? sorted[sorted.length - 1]   : null;
+
+  const sg       = [...gVals].sort((a, b) => a - b);
+  const gRange   = fluidG && sg.length >= 2;
+
+  /* x-coordinate of point p */
+  const px = p => CX + p * U;
+  /* y-coordinate of gender point g */
+  const gy = g => CY - g * U;
+
+  /* X-axis label columns (rotated) */
+  const XLBL_R = SZ - 9;
+  const XLBL_L = 9;
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${SZ} ${SZ}`}
+      style={{ display: "block", margin: "0 auto", maxWidth: SZ, touchAction: "none" }}>
+
+      <RoseBg/>
+
+      {/* ── Gender markers (read-only) ── */}
+      {/* Fluid range line on Y axis */}
+      {gRange && (
+        <line x1={CX} y1={gy(sg[0])} x2={CX} y2={gy(sg[sg.length - 1])}
+          stroke={CR} strokeWidth={4} strokeLinecap="round" opacity={0.65}/>
+      )}
+      {/* Dot for each selected G value */}
+      {gVals.map(g => (
+        <circle key={g} cx={CX} cy={gy(g)} r={9}
+          fill={CR} stroke="white" strokeWidth={2} opacity={0.88}/>
+      ))}
+      {/* Faint Y-axis labels for context — centred at CX, same alignment as gender scale */}
+      <text x={CX} y={gy(3) - 24}
+        textAnchor="middle" dominantBaseline="auto"
+        fill={TD} fontSize={10} fontFamily="DM Sans" fontWeight="600" opacity={0.55}>
+        {t.female}
+      </text>
+      <text x={CX} y={gy(-3) + 32}
+        textAnchor="middle" dominantBaseline="auto"
+        fill={TD} fontSize={10} fontFamily="DM Sans" fontWeight="600" opacity={0.55}>
+        {t.male}
+      </text>
+
+      {/* ── Orientation track ── */}
+      <line x1={px(-3)} y1={CY} x2={px(3)} y2={CY}
+        stroke="#ddeeed" strokeWidth={4} strokeLinecap="round"/>
+
+      {/* Fluid range fill */}
+      {hasRange && (
+        <line x1={px(rMin)} y1={CY} x2={px(rMax)} y2={CY}
+          stroke={TD} strokeWidth={4} strokeLinecap="round" opacity={0.85}/>
+      )}
+
+      {/* X-axis labels — vertical (rotated) */}
+      <text x={XLBL_R} y={CY}
+        textAnchor="middle" dominantBaseline="middle"
+        transform={`rotate(-90, ${XLBL_R}, ${CY})`}
+        fill={TD} fontSize={11} fontFamily="DM Sans" fontWeight="600">
+        {t.same}
+      </text>
+      <text x={XLBL_L} y={CY}
+        textAnchor="middle" dominantBaseline="middle"
+        transform={`rotate(-90, ${XLBL_L}, ${CY})`}
+        fill={TD} fontSize={11} fontFamily="DM Sans" fontWeight="600">
+        {t.other}
+      </text>
+
+      {/* 7 interactive points */}
+      {PTS.map(p => {
+        const selected = vals.includes(p);
+        const inRange  = hasRange && p > rMin && p < rMax;
+        return (
+          <g key={p} onPointerDown={() => toggle(p)} style={{ cursor: "pointer" }}>
+            <circle cx={px(p)} cy={CY} r={22} fill="transparent"/>
+            <circle cx={px(p)} cy={CY} r={16}
+              fill={selected ? TD : inRange ? TL : "white"}
+              stroke={selected ? TD : inRange ? TL : "#d4e8e7"}
+              strokeWidth={2.5}
+              style={{ filter: selected ? "drop-shadow(0 2px 6px rgba(42,140,136,0.35))" : "none" }}
+            />
+            <text x={px(p)} y={CY} textAnchor="middle" dominantBaseline="middle"
+              fontSize={10} fontFamily="DM Sans" fontWeight="700"
+              fill={selected ? "white" : inRange ? TD : "#aabcbb"}
+              style={{ pointerEvents: "none" }}>
+              {Math.abs(p)}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+/* ── REUSABLE COMPONENTS ─────────────────────────────────────── */
+function FluidBox({ checked, onChange, label, hint }) {
+  return (
+    <div style={{ marginTop: 14 }}>
+      <label style={{ display: "flex", alignItems: "flex-start", gap: 9, cursor: "pointer" }}>
+        <input type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)}
+          style={{ marginTop: 2, accentColor: TD, width: 16, height: 16, flexShrink: 0 }}/>
+        <span style={{ fontSize: 13, color: "#6a8a89", lineHeight: 1.45 }}>{label}</span>
+      </label>
+      {checked && (
+        <p style={{ fontSize: 11, color: T, marginTop: 6, lineHeight: 1.5, fontStyle: "italic", paddingLeft: 25 }}>
+          {hint}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function StepDots({ current, total }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 20 }}>
+      {Array.from({ length: total }).map((_, i) => (
+        <div key={i} style={{
+          width: i === current ? 20 : 7, height: 7,
+          borderRadius: 4,
+          background: i < current ? TL : i === current ? TD : "#d4e8e7",
+          transition: "all 0.25s"
+        }}/>
+      ))}
+    </div>
+  );
+}
+
+/* ── SHARED STYLES ───────────────────────────────────────────── */
+const wrap = {
+  fontFamily: "'DM Sans', sans-serif",
+  minHeight: "100vh", background: BG,
+  display: "flex", flexDirection: "column",
+  alignItems: "center", justifyContent: "flex-start",
+  padding: "20px 14px 48px"
+};
+const card = {
+  background: "white", borderRadius: 18,
+  padding: "24px 20px",
+  boxShadow: "0 2px 24px rgba(0,0,0,0.07)",
+  width: "100%", maxWidth: 480, marginBottom: 14
+};
+const Btn = (bg, fg, ex = {}) => ({
+  background: bg, color: fg, border: "none",
+  borderRadius: 10, padding: "13px 22px",
+  fontSize: 14, fontWeight: "600", cursor: "pointer",
+  fontFamily: "'DM Sans', sans-serif",
+  transition: "opacity 0.15s", ...ex
+});
+
+/* ── DONE PLOT ───────────────────────────────────────────────── */
+/*
+ * Full wind rose with the participant's result plotted on it.
+ * X axis = sexual orientation  (–3 other sex … +3 same sex)
+ * Y axis = gender identity     (–3 male       … +3 female)
+ *
+ * Single point  → coral dot
+ * Fluid G only  → vertical segment at each selected O, dots at endpoints
+ * Fluid O only  → horizontal segment at each selected G, dots at endpoints
+ * Both fluid    → filled coral rectangle spanning the range, with corner dots
+ */
+function DonePlot({ gVals, fluidG, oVals, fluidO, t }) {
+  const DSZ = 320, DCX = 160, DCY = 160, DU = 32;
+
+  const dpy = p => DCY - p * DU;   // gender  → y
+  const dpx = p => DCX + p * DU;   // orient  → x
+
+  const sg = [...gVals].sort((a, b) => a - b);
+  const so = [...oVals].sort((a, b) => a - b);
+
+  const useGRange = fluidG && sg.length > 1;
+  const useORange = fluidO && so.length > 1;
+
+  const gMin = sg[0],            gMax = sg[sg.length - 1];
+  const oMin = so[0],            oMax = so[so.length - 1];
+
+  /* All (g, o) combos for individual dots */
+  const combos = [];
+  for (const g of gVals) for (const o of oVals) combos.push({ g, o });
+
+  /* Petal definitions reuse the same helper */
+  const petals = [
+    { d: petalPath(DCX, DCY, DCX,       DCY-3*DU, 18), fill: T,  o: 0.25 },
+    { d: petalPath(DCX, DCY, DCX,       DCY+3*DU, 18), fill: T,  o: 0.25 },
+    { d: petalPath(DCX, DCY, DCX+3*DU,  DCY,      18), fill: T,  o: 0.25 },
+    { d: petalPath(DCX, DCY, DCX-3*DU,  DCY,      18), fill: T,  o: 0.25 },
+    { d: petalPath(DCX, DCY, DCX+3*DU,  DCY-3*DU, 12), fill: TL, o: 0.18 },
+    { d: petalPath(DCX, DCY, DCX-3*DU,  DCY-3*DU, 12), fill: TL, o: 0.18 },
+    { d: petalPath(DCX, DCY, DCX+3*DU,  DCY+3*DU, 12), fill: TL, o: 0.18 },
+    { d: petalPath(DCX, DCY, DCX-3*DU,  DCY+3*DU, 12), fill: TL, o: 0.18 },
+  ];
+
+  /* Grid dots */
+  const gridDots = [];
+  for (let g = -3; g <= 3; g++)
+    for (let o = -3; o <= 3; o++)
+      gridDots.push({ x: dpx(o), y: dpy(g) });
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${DSZ} ${DSZ}`}
+      style={{ display: "block", margin: "0 auto", maxWidth: DSZ }}>
+
+      {/* Background */}
+      <circle cx={DCX} cy={DCY} r={3*DU + 14} fill={TP} opacity={0.38}/>
+
+      {/* Petals */}
+      {petals.map((p, i) => <path key={i} d={p.d} fill={p.fill} opacity={p.o}/>)}
+
+      {/* Faint grid lines */}
+      {[-3,-2,-1,1,2,3].map(v => (
+        <g key={v} opacity={0.10}>
+          <line x1={dpx(v)} y1={DCY-3*DU} x2={dpx(v)} y2={DCY+3*DU} stroke="#4a7a78" strokeWidth={1}/>
+          <line x1={DCX-3*DU} y1={dpy(v)} x2={DCX+3*DU} y2={dpy(v)} stroke="#4a7a78" strokeWidth={1}/>
+        </g>
+      ))}
+
+      {/* Grid dots */}
+      {gridDots.map((d, i) => <circle key={i} cx={d.x} cy={d.y} r={2} fill="white" opacity={0.45}/>)}
+
+      {/* Axes */}
+      <line x1={DCX-3*DU} y1={DCY} x2={DCX+3*DU} y2={DCY} stroke={TL} strokeWidth={1} opacity={0.30}/>
+      <line x1={DCX} y1={DCY-3*DU} x2={DCX} y2={DCY+3*DU} stroke={TL} strokeWidth={1} opacity={0.30}/>
+
+      {/* ── Axis labels ── */}
+      {/* Y axis — horizontal, above/below */}
+      <text x={DCX} y={dpy(3) - 26}
+        textAnchor="middle" dominantBaseline="auto"
+        fill={TD} fontSize={11} fontFamily="DM Sans" fontWeight="600">
+        {t.female}
+      </text>
+      <text x={DCX} y={dpy(-3) + 34}
+        textAnchor="middle" dominantBaseline="auto"
+        fill={TD} fontSize={11} fontFamily="DM Sans" fontWeight="600">
+        {t.male}
+      </text>
+
+      {/* X axis — vertical (rotated), left/right */}
+      <text x={DSZ - 9} y={DCY}
+        textAnchor="middle" dominantBaseline="middle"
+        transform={`rotate(-90, ${DSZ - 9}, ${DCY})`}
+        fill={TD} fontSize={11} fontFamily="DM Sans" fontWeight="600">
+        {t.same}
+      </text>
+      <text x={9} y={DCY}
+        textAnchor="middle" dominantBaseline="middle"
+        transform={`rotate(-90, 9, ${DCY})`}
+        fill={TD} fontSize={11} fontFamily="DM Sans" fontWeight="600">
+        {t.other}
+      </text>
+
+      {/* ── User result marker ── */}
+
+      {/* CASE: both fluid → filled rectangle */}
+      {useGRange && useORange && (
+        <rect
+          x={dpx(oMin)} y={dpy(gMax)}
+          width={dpx(oMax) - dpx(oMin)}
+          height={dpy(gMin) - dpy(gMax)}
+          fill={CR} opacity={0.22} rx={4}
+        />
+      )}
+
+      {/* Fluid-G lines: vertical segment for each selected O */}
+      {useGRange && so.map(o => (
+        <line key={`fg${o}`}
+          x1={dpx(o)} y1={dpy(gMin)}
+          x2={dpx(o)} y2={dpy(gMax)}
+          stroke={CR} strokeWidth={useORange ? 1.5 : 4}
+          strokeLinecap="round" opacity={0.78}/>
+      ))}
+
+      {/* Fluid-O lines: horizontal segment for each selected G */}
+      {useORange && sg.map(g => (
+        <line key={`fo${g}`}
+          x1={dpx(oMin)} y1={dpy(g)}
+          x2={dpx(oMax)} y2={dpy(g)}
+          stroke={CR} strokeWidth={useGRange ? 1.5 : 4}
+          strokeLinecap="round" opacity={0.78}/>
+      ))}
+
+      {/* Single crosshair only when exactly one point */}
+      {combos.length === 1 && (() => {
+        const { g, o } = combos[0];
+        return <>
+          <line x1={dpx(o)} y1={DCY} x2={dpx(o)} y2={dpy(g)}
+            stroke={CR} strokeWidth={1} strokeDasharray="3 3" opacity={0.35}/>
+          <line x1={DCX} y1={dpy(g)} x2={dpx(o)} y2={dpy(g)}
+            stroke={CR} strokeWidth={1} strokeDasharray="3 3" opacity={0.35}/>
+        </>;
+      })()}
+
+      {/* Coral dots at every (g, o) combination */}
+      {combos.map(({ g, o }, i) => (
+        <circle key={i} cx={dpx(o)} cy={dpy(g)}
+          r={9} fill={CR} stroke="white" strokeWidth={2.5} opacity={0.92}/>
+      ))}
+    </svg>
+  );
+}
+
+/* ── APP ─────────────────────────────────────────────────────── */
+/*
+ * Phases: intro, sex, then identity / drawG / drawO in the order set by the token, then done
+ */
+function App() {
+  const [lang,      setLang]      = useState("it");
+  const [phase,     setPhase]     = useState("intro");
+  const [timepoint, setTimepoint] = useState("");          // "T1" | "T2"
+  const [participantToken, setParticipantToken] = useState(""); // token inserito da utente T2
+  const [generatedToken,   setGeneratedToken]   = useState(""); // token generato a fine T1
+  const [copied,    setCopied]    = useState(false);
+  const [reminderEmail, setReminderEmail] = useState("");
+  const [emailSent,     setEmailSent]     = useState(false);
+  const [consent,   setConsent]   = useState(false);
+  const [sex,       setSex]       = useState(null);
+  const [age,       setAge]       = useState("");
+  const [genderLbl, setGenderLbl] = useState("");
+  const [orientLbl, setOrientLbl] = useState("");
+  const [gVals,     setGVals]     = useState([]);
+  const [fluidG,    setFluidG]    = useState(false);
+  const [oVals,     setOVals]     = useState([]);
+  const [fluidO,    setFluidO]    = useState(false);
+  const [busy,      setBusy]      = useState(false);
+  const [errMsg,    setErrMsg]    = useState("");
+  const [backNav,     setBackNav]     = useState(0);  // cross-block "back" presses
+  const [tBlockStart, setTBlockStart] = useState(""); // entering the first block
+  const [tBlockMid,   setTBlockMid]   = useState(""); // leaving the first block
+
+  const t = L[lang];
+
+  /* genderOpts dipende dal sesso biologico selezionato */
+  const genderOpts = sex === "Y" ? t.genderOptsAMAB : t.genderOptsAFAB;
+
+  /* Block order: derived from the token (see ORDER RANDOMIZATION) */
+  const activeToken = timepoint === "T1" ? generatedToken : participantToken.trim().toUpperCase();
+  const order = orderFromToken(activeToken);   // null until a valid token exists
+  const seq = order === "LABELS_first" ? ["identity", "drawG", "drawO"] : ["drawG", "drawO", "identity"];
+  const lastPhase = seq[seq.length - 1];
+  const firstBlockLast = order === "LABELS_first" ? "identity" : "drawO";
+  const blockOf = p => (p === "identity" ? "labels" : "xygo");
+  const goFromSex = () => {
+    if (!tBlockStart) setTBlockStart(new Date().toISOString());
+    setPhase(seq[0]);
+  };
+  const goNext = from => {
+    if (from === firstBlockLast && !tBlockMid) setTBlockMid(new Date().toISOString());
+    setPhase(seq[seq.indexOf(from) + 1]);
+  };
+  const goBack = from => {
+    const i = seq.indexOf(from);
+    if (i === 0) { setPhase("sex"); return; }
+    const to = seq[i - 1];
+    if (blockOf(to) !== blockOf(from)) setBackNav(n => n + 1);
+    setPhase(to);
+  };
+
+  const reset = () => {
+    setPhase("intro"); setConsent(false); setSex(null); setTimepoint("");
+    setParticipantToken(""); setGeneratedToken(""); setCopied(false);
+    setReminderEmail(""); setEmailSent(false);
+    setAge(""); setGenderLbl(""); setOrientLbl("");
+    setGVals([]); setFluidG(false); setOVals([]); setFluidO(false);
+    setBusy(false); setErrMsg("");
+    setBackNav(0); setTBlockStart(""); setTBlockMid("");
+  };
+
+  const notation  = buildNotation(sex, gVals, fluidG, oVals, fluidO);
+  const ageValid  = age && parseInt(age) >= 10 && parseInt(age) <= 99;
+  const tokenOk   = !!order;
+  const canSubmit = !!(timepoint && tokenOk && sex && ageValid && gVals.length > 0 && oVals.length > 0 && genderLbl && orientLbl);
+
+  
+
+  /* Invia la richiesta di reminder (chiamata separata, post-submit) */
+  const sendReminderEmail = async () => {
+    if (!reminderEmail.trim() || emailSent) return;
+    try {
+      await fetch(WEBHOOK, {
+        method: "POST", mode: "no-cors",
+        headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({
+          action:    "reminder",
+          token:     generatedToken,
+          email:     reminderEmail.trim(),
+          timestamp: new Date().toISOString(),
+          lang,
+        })
+      });
+      setEmailSent(true);
+    } catch (_) { /* silenzioso: il dato principale è già salvato */ }
+  };
+
+  const submit = async () => {
+    if (!canSubmit || busy) return;
+    if (!WEBHOOK_OK) { setErrMsg("Webhook not configured: set WEBHOOK in index.html."); return; }
+    setBusy(true); setErrMsg("");
+    const sg = [...gVals].sort((a, b) => a - b);
+    const so = [...oVals].sort((a, b) => a - b);
+    const token = activeToken;
+    const payload = {
+      timestamp:    new Date().toISOString(),
+      timepoint,
+      token,
+      order,
+      version:      STUDY_VERSION,
+      lang, sex,
+      age:          age || "",
+      genderLabel:  genderLbl,
+      orientLabel:  orientLbl,
+      genderScores: sg.map(fmt).join(","),
+      fluidGender:  fluidG,
+      orientScores: so.map(fmt).join(","),
+      fluidOrient:  fluidO,
+      notation,
+      backNav,
+      tBlockStart,
+      tBlockMid,
+    };
+    try {
+      await fetch(WEBHOOK, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify(payload)
+      });
+      setPhase("done");
+    } catch {
+      setErrMsg(t.errMsg);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /* Language toggle */
+  const LangToggle = () => (
+    <div style={{ width: "100%", maxWidth: 480, display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+      {["en","it"].map(l => (
+        <button key={l} onClick={() => setLang(l)} style={{
+          background: lang === l ? TD : "transparent",
+          color: lang === l ? "white" : "#9ab",
+          border: `1.5px solid ${lang === l ? TD : "#d4e8e7"}`,
+          borderRadius: 7, padding: "4px 13px", marginLeft: 6,
+          fontSize: 11, fontWeight: "700", cursor: "pointer",
+          fontFamily: "'DM Sans', sans-serif", letterSpacing: 1
+        }}>{l.toUpperCase()}</button>
+      ))}
+    </div>
+  );
+
+  /* ─── INTRO ─────────────────────────────────────────────────── */
+  if (phase === "intro") {
+    const tpBtn = (val, label) => (
+      <button key={val} onClick={() => { setTimepoint(val); setParticipantToken(""); }}
+        style={{
+          flex: 1, padding: "13px 10px", borderRadius: 10, cursor: "pointer",
+          border: `2px solid ${timepoint === val ? TD : "#d4e8e7"}`,
+          background: timepoint === val ? TP : "white",
+          color: timepoint === val ? TD : "#8aabaa",
+          fontSize: 13, fontWeight: timepoint === val ? "700" : "400",
+          fontFamily: "'DM Sans', sans-serif", transition: "all 0.15s"
+        }}>{label}</button>
+    );
+    const canBegin = consent && timepoint && (timepoint === "T1" || TOKEN_RE.test(participantToken.trim().toUpperCase()));
+    return (
+      <div style={wrap}>
+        <div style={card}>
+          <div style={{ textAlign: "center", marginBottom: 14 }}>
+            <div style={{ fontSize: 48, lineHeight: 1, marginBottom: 8 }}>🌹</div>
+            <h1 style={{ fontFamily: "'DM Serif Display', serif", color: TD, fontSize: 34, letterSpacing: 3, marginBottom: 2 }}>
+              {t.roseTitle}
+            </h1>
+            <div style={{ color: TL, fontSize: 12, fontWeight: "600", letterSpacing: 5 }}>{t.roseSub}</div>
+          </div>
+
+          {/* Selettore lingua — sotto titolo e sottotitolo */}
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: 24 }}>
+            {["en","it"].map(l => (
+              <button key={l} onClick={() => setLang(l)} style={{
+                background: lang === l ? TD : "transparent",
+                color: lang === l ? "white" : "#9ab",
+                border: `1.5px solid ${lang === l ? TD : "#d4e8e7"}`,
+                borderRadius: 7, padding: "4px 13px", marginLeft: 6, marginRight: 6,
+                fontSize: 11, fontWeight: "700", cursor: "pointer",
+                fontFamily: "'DM Sans', sans-serif", letterSpacing: 1
+              }}>{l.toUpperCase()}</button>
+            ))}
+          </div>
+
+          {/* Protocollo di validazione */}
+          <p style={{ color: "#4a6665", lineHeight: 1.7, fontSize: 14, marginBottom: 10 }}>
+            {t.protocolA}<strong style={{ color: TD }}>{t.protocolB}</strong>
+            {t.protocolC}<strong style={{ color: TD }}>{t.protocolD}</strong>{t.protocolE}
+          </p>
+
+          {/* Box avviso — gap temporale ben visibile */}
+          <div style={{
+            background: "#fff8e7", border: "1.5px solid #f5c842", borderRadius: 10,
+            padding: "10px 14px", marginBottom: 20
+          }}>
+            <p style={{ fontSize: 12.5, color: "#9a7a1a", fontWeight: "600", margin: 0, lineHeight: 1.5 }}>
+              {t.protocolNotice}
+            </p>
+          </div>
+
+          <p style={{ color: "#4a6665", lineHeight: 1.7, fontSize: 14, marginBottom: 10 }}>
+            {t.p1a}<strong style={{ color: "#333" }}>{t.p1b}</strong>
+            {t.p1c}<strong style={{ color: TD }}>{t.p1d}</strong>
+            {t.p1e}<strong style={{ color: TD }}>{t.p1f}</strong>{t.p1g}
+          </p>
+          <p style={{ color: "#8aabaa", lineHeight: 1.7, fontSize: 13, marginBottom: 22 }}>
+            {t.p2a}<strong style={{ color: "#6a8a89" }}>{t.p2b}</strong>{t.p2c}
+          </p>
+
+          {/* Selettore T1 / T2 */}
+          <div style={{ marginBottom: 18 }}>
+            <div style={{ fontSize: 13, color: "#6a8a89", fontWeight: "600", marginBottom: 10 }}>
+              {t.timepointQ}
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              {tpBtn("T1", t.tp1)}
+              {tpBtn("T2", t.tp2)}
+            </div>
+          </div>
+
+          {/* Campo token — visibile solo se T2 */}
+          {timepoint === "T2" && (
+            <div style={{ marginBottom: 18 }}>
+              <label style={{ fontSize: 13, color: "#6a8a89", fontWeight: "600", display: "block", marginBottom: 8 }}>
+                {t.tokenInputLabel}
+              </label>
+              <input
+                type="text"
+                value={participantToken}
+                onChange={e => setParticipantToken(e.target.value.toUpperCase())}
+                placeholder={t.tokenInputPh}
+                maxLength={6}
+                style={{
+                  width: "100%", padding: "11px 14px",
+                  border: `1.5px solid ${TD}`, borderRadius: 9,
+                  fontSize: 16, fontWeight: "700", letterSpacing: 3,
+                  outline: "none", fontFamily: "'DM Sans', sans-serif",
+                  color: TD, background: TP, textTransform: "uppercase"
+                }}
+              />
+              <p style={{ fontSize: 11, color: "#8aabaa", marginTop: 6, lineHeight: 1.5 }}>
+                {t.tokenInputHint}
+              </p>
+              {participantToken.trim().length === 6 && !TOKEN_RE.test(participantToken.trim()) && (
+                <p style={{ fontSize: 12, color: CR, marginTop: 6, lineHeight: 1.5 }}>{t.tokenInvalid}</p>
+              )}
+            </div>
+          )}
+
+          <label style={{
+            display: "flex", alignItems: "flex-start", gap: 11, cursor: "pointer",
+            background: TP, borderRadius: 10, padding: "14px", marginBottom: 22
+          }}>
+            <input type="checkbox" checked={consent} onChange={e => setConsent(e.target.checked)}
+              style={{ marginTop: 2, accentColor: TD, width: 17, height: 17, flexShrink: 0 }}/>
+            <span style={{ fontSize: 13, color: "#4a6665", lineHeight: 1.55 }}>{t.consentText}</span>
+          </label>
+          <button onClick={() => { if (timepoint === "T1" && !generatedToken) setGeneratedToken(randomToken()); setPhase("sex"); }} disabled={!canBegin}
+            style={Btn(canBegin ? TD : "#c8dede", "white", { width: "100%", fontSize: 15 })}>
+            {t.begin}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  /* ─── SEX ───────────────────────────────────────────────────── */
+  if (phase === "sex") return (
+    <div style={wrap}>
+      <LangToggle/>
+      <div style={card}>
+        <StepDots current={0} total={4}/>
+        <h2 style={{ fontFamily: "'DM Serif Display', serif", color: TD, fontSize: 22, marginBottom: 6 }}>
+          {t.sexTitle}
+        </h2>
+        <p style={{ color: "#8aabaa", fontSize: 13, marginBottom: 22 }}>{t.sexSub}</p>
+
+        {/* Età obbligatoria */}
+        <div style={{ marginBottom: 22 }}>
+          <label style={{ fontSize: 13, color: "#6a8a89", fontWeight: "600", display: "block", marginBottom: 8 }}>
+            {t.ageQ} <span style={{ fontWeight: 400, color: "#b0cac9" }}>{t.ageReq}</span>
+          </label>
+          <input type="number" value={age} onChange={e => setAge(e.target.value)}
+            min={10} max={99} placeholder="—"
+            style={{
+              width: 100, padding: "10px 14px",
+              border: `1.5px solid ${ageValid || !age ? "#d4e8e7" : CR}`,
+              borderRadius: 9,
+              fontSize: 14, outline: "none", fontFamily: "'DM Sans', sans-serif", color: "#333"
+            }}/>
+        </div>
+
+        <div style={{ display: "flex", gap: 14, marginBottom: 16 }}>
+          {[
+            { val: "X", symbol: "\u2640", label: t.afab },
+            { val: "Y", symbol: "\u2642", label: t.amab }
+          ].map(opt => (
+            <button key={opt.val} onPointerDown={() => setSex(opt.val)} style={{
+              flex: 1, padding: "22px 12px", borderRadius: 14, cursor: "pointer",
+              border: `2px solid ${sex === opt.val ? TD : "#d4e8e7"}`,
+              background: sex === opt.val ? TP : "white", textAlign: "center",
+              transition: "all 0.15s",
+              boxShadow: sex === opt.val ? "0 4px 16px rgba(42,140,136,0.18)" : "none"
+            }}>
+              <div style={{ fontSize: 42, marginBottom: 10, color: sex === opt.val ? TD : "#8aabaa" }}>
+                {opt.symbol}
+              </div>
+              <div style={{
+                fontSize: 11, color: sex === opt.val ? TD : "#8aabaa",
+                fontWeight: "600", whiteSpace: "pre-line", lineHeight: 1.45
+              }}>{opt.label}</div>
+            </button>
+          ))}
+        </div>
+        <p style={{ fontSize: 11, color: "#b0cac9", lineHeight: 1.55, marginBottom: 22 }}>{t.dsd}</p>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={() => setPhase("intro")}
+            style={Btn("white", "#8aabaa", { border: "1.5px solid #d4e8e7", flex: 1 })}>{t.back}</button>
+          <button onClick={goFromSex} disabled={!sex || !ageValid}
+            style={Btn(sex && ageValid ? TD : "#c8dede", "white", { flex: 1 })}>{t.next}</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  /* ─── IDENTITY ──────────────────────────────────────────────── */
+  if (phase === "identity") {
+    const optBtn = (label, selected, onClick) => (
+      <button key={label} onClick={onClick} style={{
+        display: "block", width: "100%", textAlign: "left",
+        padding: "10px 14px", marginBottom: 6, borderRadius: 9,
+        border: `1.5px solid ${selected ? TD : "#d4e8e7"}`,
+        background: selected ? TP : "white",
+        color: selected ? TD : "#4a6665",
+        fontSize: 13, fontWeight: selected ? "600" : "400",
+        cursor: "pointer", transition: "all 0.12s",
+        fontFamily: "'DM Sans', sans-serif"
+      }}>{label}</button>
+    );
+    const identOk = !!(genderLbl && orientLbl);
+    return (
+      <div style={wrap}>
+        <LangToggle/>
+        <div style={card}>
+          <StepDots current={seq.indexOf("identity") + 1} total={4}/>
+          <h2 style={{ fontFamily: "'DM Serif Display', serif", color: TD, fontSize: 22, marginBottom: 20 }}>
+            {t.identityTitle}
+          </h2>
+          {/* Gender label — opzioni dipendenti dal sesso biologico */}
+          <div style={{ marginBottom: 22 }}>
+            <label style={{ fontSize: 13, color: "#6a8a89", fontWeight: "600", display: "block", marginBottom: 10 }}>
+              {t.genderQ}
+            </label>
+            {genderOpts.map(o => optBtn(o, genderLbl === o, () => setGenderLbl(o)))}
+          </div>
+          {/* Orientation label */}
+          <div style={{ marginBottom: 24 }}>
+            <label style={{ fontSize: 13, color: "#6a8a89", fontWeight: "600", display: "block", marginBottom: 10 }}>
+              {t.orientQ}
+            </label>
+            {t.orientOpts.map(o => optBtn(o, orientLbl === o, () => setOrientLbl(o)))}
+          </div>
+
+          {errMsg && <p style={{ color: CR, fontSize: 13, textAlign: "center", marginTop: 12 }}>{errMsg}</p>}
+
+          <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+            <button onClick={() => goBack("identity")}
+              style={Btn("white", "#8aabaa", { border: "1.5px solid #d4e8e7", flex: 1 })}>{t.back}</button>
+            {lastPhase === "identity" ? (
+              <button onClick={submit} disabled={!canSubmit || busy}
+                style={Btn(canSubmit ? TD : "#c8dede", "white", { flex: 1 })}>
+                {busy ? t.saving : t.submit}
+              </button>
+            ) : (
+              <button onClick={() => goNext("identity")} disabled={!identOk}
+                style={Btn(identOk ? TD : "#c8dede", "white", { flex: 1 })}>{t.next}</button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ─── DRAW G (vertical gender scale on rose) ────────────────── */
+  if (phase === "drawG") return (
+    <div style={wrap}>
+      <LangToggle/>
+      <div style={card}>
+        <StepDots current={seq.indexOf("drawG") + 1} total={4}/>
+        <h2 style={{
+          fontFamily: "'DM Serif Display', serif",
+          color: TD, fontSize: 22, marginBottom: 6
+        }}>{t.genderScaleTitle}</h2>
+        <p style={{ fontSize: 13, color: "#8aabaa", lineHeight: 1.6, marginBottom: 16 }}>
+          {t.genderDesc}
+        </p>
+
+        <GenderScaleSVG
+          vals={gVals} fluid={fluidG}
+          onChange={setGVals}
+          t={t}
+        />
+
+        <FluidBox
+          checked={fluidG}
+          onChange={v => { setFluidG(v); if (!v) setGVals(gVals); }}
+          label={t.fluidLabel}
+          hint={t.fluidHint}
+        />
+
+        <div style={{ display: "flex", gap: 10, marginTop: 22 }}>
+          <button onClick={() => goBack("drawG")}
+            style={Btn("white", "#8aabaa", { border: "1.5px solid #d4e8e7", flex: 1 })}>{t.back}</button>
+          <button onClick={() => goNext("drawG")} disabled={gVals.length === 0}
+            style={Btn(gVals.length > 0 ? TD : "#c8dede", "white", { flex: 1 })}>{t.next}</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  /* ─── DRAW O (horizontal orientation scale on rose) ─────────── */
+  if (phase === "drawO") return (
+    <div style={wrap}>
+      <LangToggle/>
+      <div style={card}>
+        <StepDots current={seq.indexOf("drawO") + 1} total={4}/>
+        <h2 style={{
+          fontFamily: "'DM Serif Display', serif",
+          color: TD, fontSize: 22, marginBottom: 6
+        }}>{t.orientScaleTitle}</h2>
+        <p style={{ fontSize: 13, color: "#8aabaa", lineHeight: 1.6, marginBottom: 16 }}>
+          {t.orientDesc}
+        </p>
+
+        <OrientScaleSVG
+          gVals={gVals} fluidG={fluidG}
+          vals={oVals} fluid={fluidO}
+          onChange={setOVals}
+          t={t}
+        />
+
+        <FluidBox
+          checked={fluidO}
+          onChange={setFluidO}
+          label={t.orientFluidLabel}
+          hint={t.orientFluidHint}
+        />
+
+        {errMsg && <p style={{ color: CR, fontSize: 13, textAlign: "center", marginTop: 12 }}>{errMsg}</p>}
+
+        <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+          <button onClick={() => goBack("drawO")}
+            style={Btn("white", "#8aabaa", { border: "1.5px solid #d4e8e7", flex: 1 })}>{t.back}</button>
+          {lastPhase === "drawO" ? (
+            <button onClick={submit} disabled={!canSubmit || busy}
+              style={Btn(canSubmit ? TD : "#c8dede", "white", { flex: 1 })}>
+              {busy ? t.saving : t.submit}
+            </button>
+          ) : (
+            <button onClick={() => goNext("drawO")} disabled={oVals.length === 0}
+              style={Btn(oVals.length > 0 ? TD : "#c8dede", "white", { flex: 1 })}>{t.next}</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  /* ─── DONE ──────────────────────────────────────────────────── */
+  return (
+    <div style={{ ...wrap, justifyContent: "center" }}>
+      <div style={{ ...card, textAlign: "center", padding: "32px 20px 40px" }}>
+        <div style={{ fontSize: 60, marginBottom: 10 }}>🌹</div>
+        <h2 style={{ fontFamily: "'DM Serif Display', serif", color: TD, fontSize: 28, marginBottom: 6 }}>
+          {t.doneTitle}
+        </h2>
+        <p style={{ color: "#9ab", fontSize: 14, marginBottom: 20 }}>
+          {timepoint === "T2" ? t.doneSubT2 : t.doneSub}
+        </p>
+
+        {/* Token box — solo T1 */}
+        {timepoint === "T1" && generatedToken && (
+          <div style={{
+            background: "#fff8e7", borderRadius: 14,
+            padding: "20px 20px 16px", marginBottom: 22,
+            border: "2px solid #f5c842"
+          }}>
+            <div style={{ fontSize: 12, color: "#b8860b", fontWeight: "600", marginBottom: 10, letterSpacing: 0.5 }}>
+              ⚠️ {t.doneTokenLabel}
+            </div>
+            <div style={{
+              fontFamily: "'DM Serif Display', serif",
+              fontSize: 38, color: "#b8860b", letterSpacing: 8,
+              marginBottom: 12, fontWeight: "700"
+            }}>
+              {generatedToken}
+            </div>
+            <button
+              onClick={() => { navigator.clipboard.writeText(generatedToken).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2500); }); }}
+              style={Btn(copied ? "#4da84a" : "#f5c842", "white", { padding: "9px 24px", fontSize: 13, marginBottom: 12 })}>
+              {copied ? t.doneCopied : t.doneCopyBtn}
+            </button>
+            <p style={{ fontSize: 12, color: "#9a7a1a", lineHeight: 1.55, margin: 0 }}>
+              {t.doneTokenInstr}
+            </p>
+          </div>
+        )}
+
+        {/* Email reminder opzionale — solo T1 */}
+        {timepoint === "T1" && generatedToken && (
+          <div style={{
+            background: "white", borderRadius: 14,
+            padding: "18px 20px", marginBottom: 22,
+            border: `1.5px solid ${TL}`
+          }}>
+            <div style={{ fontSize: 13, color: "#6a8a89", fontWeight: "600", marginBottom: 10 }}>
+              📧 {t.emailOptLabel}
+            </div>
+            <input
+              type="email"
+              value={reminderEmail}
+              onChange={e => setReminderEmail(e.target.value)}
+              placeholder={t.emailOptPh}
+              disabled={emailSent}
+              style={{
+                width: "100%", padding: "10px 13px", marginBottom: 8,
+                border: `1.5px solid ${emailSent ? "#c8dede" : TD}`,
+                borderRadius: 9, fontSize: 13, outline: "none",
+                fontFamily: "'DM Sans', sans-serif",
+                color: emailSent ? "#9ab" : "#333",
+                background: emailSent ? "#f0f5f5" : "white",
+                boxSizing: "border-box"
+              }}
+            />
+            <button
+              onClick={sendReminderEmail}
+              disabled={!reminderEmail.trim() || emailSent}
+              style={Btn(
+                emailSent ? "#4da84a" : (reminderEmail.trim() ? TD : "#c8dede"),
+                "white",
+                { width: "100%", fontSize: 13, marginBottom: 8 }
+              )}>
+              {emailSent ? t.emailOptSent : t.emailOptBtn}
+            </button>
+            <p style={{ fontSize: 11, color: "#9ab", lineHeight: 1.55, margin: 0 }}>
+              🔒 {t.emailOptHint}
+            </p>
+          </div>
+        )}
+
+        {/* Wind rose with plotted result */}
+        <DonePlot
+          gVals={gVals} fluidG={fluidG}
+          oVals={oVals} fluidO={fluidO}
+          t={t}
+        />
+
+        {/* Notation */}
+        <div style={{
+          background: TP, borderRadius: 12,
+          padding: "16px 20px", margin: "20px 0 28px",
+          border: `1px solid ${TL}`
+        }}>
+          <div style={{ fontSize: 11, color: "#9ab", marginBottom: 6, fontWeight: 500 }}>{t.doneLabel}</div>
+          <div style={{ fontFamily: "'DM Serif Display', serif", fontSize: 24, color: TD, letterSpacing: 1 }}>
+            {notation}
+          </div>
+        </div>
+
+        <button onClick={reset} style={Btn(TD, "white", { padding: "14px 36px", fontSize: 15 })}>
+          {t.newResp}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
